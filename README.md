@@ -1,0 +1,420 @@
+# vpptc — VPP Simple Policer YAML Synchronizer
+
+`vpptc` menyinkronkan konfigurasi **simple-policer** VPP dari file YAML ke runtime VPP,
+lalu menulis ulang file CLI startup agar konfigurasi tetap bisa dimuat ulang.
+
+Tool ini bersifat **deklaratif**: YAML adalah sumber kebenaran. Yang tidak ada di YAML
+akan dilepas dari VPP — termasuk oleh `vpptc` sendiri.
+
+```
+/etc/vpp/vpptc.yaml  ──►  vpptc  ──►  vppctl (runtime VPP)
+                              └────►  /etc/vpp/vpptc.vpp (untuk persistensi saat boot)
+```
+
+---
+
+## Daftar Isi
+
+- [Kebutuhan Sistem](#kebutuhan-sistem)
+- [Instalasi](#instalasi)
+- [Konfigurasi YAML](#konfigurasi-yaml)
+- [Pemakaian](#pemakaian)
+- [Cara Kerja](#cara-kerja)
+- [Konvensi Nama Policer](#konvensi-nama-policer)
+- [Keamanan](#keamanan)
+- [Exit Code](#exit-code)
+- [Pemecahan Masalah](#pemecahan-masalah)
+- [Catatan Operasional](#catatan-operasional)
+
+---
+
+## Kebutuhan Sistem
+
+| Komponen | Versi / Keterangan |
+|---|---|
+| Python | 3.6+ (diuji 3.11.2) |
+| PyYAML | 6.0 |
+| `vppctl` | VPP 20.05+ (diuji v26.06-release) |
+| Akses | `vppctl` harus terhubung ke daemon VPP (umumnya perlu root) |
+| Lock | `/run/lock/` harus ada dan bisa ditulis |
+
+Hanya dependensi standar + PyYAML. Tidak ada library pihak ketiga lain.
+
+---
+
+## Instalasi
+
+```bash
+# 1. salin tool ke lokasi permanen
+install -m 755 vpptc /usr/local/sbin/vpptc
+
+# 2. pastikan dependensi ada
+python3 -c "import yaml" || pip3 install pyyaml
+
+# 3. cek versi
+/usr/local/sbin/vpptc --help
+```
+
+> **Penting:** jangan menaruh script di direktori yang tidak bisa diakses user lain
+> (mis. `/root`) bilahendak dijalankan oleh service/cron non-root. `/root` mode `0700`.
+
+Buat file konfigurasi pertama:
+
+```bash
+cat > /etc/vpp/vpptc.yaml <<'EOF'
+simple_policers:
+  - interface: "TenGigabitEthernet1/0/0"
+    input:
+      cir: "10m"
+      cb: "100k"
+    output:
+      cir: 5000
+      cb: 64000
+EOF
+```
+
+---
+
+## Konfigurasi YAML
+
+### Struktur
+
+```yaml
+simple_policers:
+  - interface: "<nama-interface>"     # wajib
+    input:                            # opsional
+      cir: "<nilai>"                  # wajib bila blok input ada
+      cb: "<nilai>"                   # wajib bila blok input ada
+    output:                           # opsional
+      cir: "<nilai>"
+      cb: "<nilai>"
+```
+
+### Aturan
+
+| Key | Wajib | Keterangan |
+|---|---|---|
+| `simple_policers` | ya | List. `[]` berarti tidak ada policer sama sekali. |
+| `interface` | ya | Nama interface VPP. Harus berupa teks dan ada di runtime VPP. |
+| `input` / `output` | tidak | Maksimal **satu** per arah (lihat [batasan](#batasan-penting)). |
+| `cir` | ya (bila arah ada) | *Committed Information Rate* dalam kbps. |
+| `cb` | ya (bila arah ada) | *Committed Burst* dalam byte. |
+
+Key yang tidak dikenali **ditolak**, baik di level root maupun level enti. Salah eja tidak
+akan lolos diam-diam.
+
+### Satuan yang didukung
+
+| `cir` (kbps) | `cb` (byte) |
+|---|---|
+| `10m`, `10M`, `10 mbps` | `100k`, `100KB`, `100 kbytes` |
+| `5000`, `5000k`, `5000kbps` | `64000`, `64000b`, `64000 bytes` |
+| `1g`, `1000mbps` | `3g`, `3gb`, `3gbytes` |
+
+Nilai boleh berupa angka (`cir: 5000`) maupun teks (`cir: "10m"`). Huruf besar/kecil dan
+spasi diabaikan: `" 10 M "` = `10m`.
+
+Nilai desimal dibulatkan **half-up**, bukan dipotong:
+`1.9k` → `2`, `0.5m` → `500`, `2.4k` → `2400`.
+
+### Nilai `0` = tanpa limitasi
+
+`cir: 0` **atau** `cb: 0` berarti arah tersebut **tidak dibatasi**, sehingga policer
+**tidak dibuat sama sekali**. Policer lama di arah tersebut otomatis dilepas.
+
+```yaml
+simple_policers:
+  - interface: "TenGigabitEthernet1/0/0"
+    input:
+      cir: "10m"
+      cb: "100k"
+    output:
+      cir: 0        # output tanpa limitasi -> tidak ada policer output
+      cb: 64000
+```
+
+> ⚠️ Karena pembulatan, nilai kecil seperti `0.4k` (= 0.4 kbps) juga menjadi `0` dan
+> berarti **tanpa limitasi**. Untuk nilai sekecil ini `vpptc` akan mencetak:
+> ```
+> [WARN] Interface 'TenGigabitEthernet1/0/0' arah 'input': CIR '0.4k' bernilai di bawah 1 satuan,
+>        membulat menjadi 0 -> dianggap TANPA LIMITASI dan policer tidak dibuat.
+> ```
+
+### Contoh lengkap
+
+```yaml
+simple_policers:
+  - interface: "TenGigabitEthernet1/0/0"
+    input:
+      cir: "10m"
+      cb: "100k"
+    output:
+      cir: 5000
+      cb: 64000
+
+  - interface: "BondEthernet1.100"
+    input:
+      cir: "50m"
+      cb: "1m"
+    output:
+      cir: "20m"
+      cb: "10m"
+```
+
+---
+
+## Pemakaian
+
+```bash
+vpptc [--dry-run] [--config PATH] [--startup-file PATH]
+```
+
+| Opsi | Default | Keterangan |
+|---|---|---|
+| `--dry-run` | — | Tampilkan diff saja. **Tidak menulis dan tidak mengubah apa pun**, termasuk file startup. |
+| `--config PATH` | `/etc/vpp/vpptc.yaml` | File konfigurasi YAML. |
+| `--startup-file PATH` | `/etc/vpp/vpptc.vpp` | File CLI startup yang dihasilkan. |
+
+### Alur kerja yang disarankan
+
+```bash
+vpptc --dry-run     # 1. lihat perubahannya
+                    # 2. periksa baris "[-] LEPAS & HAPUS" dengan teliti
+vpptc               # 3. terapkan
+```
+
+### Contoh keluaran
+
+```
+$ vpptc --dry-run
+[INFO] Membaca state VPP saat ini...
+
+==================================================
+ PERBANDINGAN KONFIGURASI (DIFF)
+==================================================
+ [-] LEPAS & HAPUS : vpptc-TenGigabitEthernet1_2F0_2F0-input-5000000-100000
+                 (dari interface TenGigabitEthernet1/0/0)
+ [+] TAMBAH & PASANG : vpptc-TenGigabitEthernet1_2F0_2F0-input-10000-100000 (CIR: 10000 kbps, CB: 100000 bytes)
+ [*] DIABAIKAN      : 1 policer di luar kepemilikan vpptc (tidak akan diubah).
+==================================================
+
+[INFO] Mode --dry-run aktif. Tidak ada perubahan yang dieksekusi ke VPP.
+```
+
+Arti penanda diff:
+
+| Penanda | Arti |
+|---|---|
+| `[=]` | Sudah sinkron, tidak ada perubahan. |
+| `[+]` | Policer baru akan dibuat dan dipasang. |
+| `[-]` | Policer lama akan dilepas dan dihapus. |
+| `[*]` | Policer milik tool lain — **tidak** akan disentuh. |
+
+---
+
+## Cara Kerja
+
+### Urutan eksekusi
+
+`vpptc` berlaku **atomik per perubahan nilai**: nama policer memuat nilai CIR/CB,
+sehingga mengubah CIR/CB menghasilkan nama baru.
+
+```
+1/4  policer add       (policer baru dibuat, belum terpasang)
+2/4  policer unapply   (policer lama dilepas dari interface)
+3/4  policer apply     (policer baru dipasang)
+4/4  policer del       (policer lama dihapus)
+     verifikasi       (state runtime dibaca ulang dan dicocokkan)
+```
+
+> Ada jeda singkat tanpa limitasi antara langkah 2 dan 3. Ini disengaja: urutan
+> "pasang yang baru dulu, baru lepas yang lama" akan menumpuk dua policer pada satu
+> interface, yang ditolak VPP.
+
+### Percadangan
+
+```
+[+] TAMBAH & PASANG   cir=10m  cb=100k
+[+] TAMBAH & PASANG   cir=10m  cb=100k   ← cir sama, cb berbeda: GANTI (bukan tambah)
+```
+
+Syarat gcd = CIR **dan** CB identik. Perubahan pada salah satu atau keduanya menghasilkan
+penggantian. Nilai tetap (mis. hanya `input` yang diisi ulang) menghasilkan `[=]`.
+
+---
+
+## Konvensi Nama Policer
+
+Nama policer yang dihasilkan `vpptc`:
+
+```
+vpptc-<token-interface>-<arah>-<cir>-<cb>
+contoh: vpptc-loop0-input-10000-100000
+contoh: vpptc-BondEthernet1_2E100-input-50000-1000000
+```
+
+### Aturan escaping (reversible)
+
+| Asli | Token | Catatan |
+|---|---|---|
+| `loop0` | `loop0` | Huruf/angka dipertahankan |
+| `BondEthernet1.100` | `BondEthernet1_2E100` | `.` → `_2E` |
+| `TenGigabitEthernet1/0/0` | `TenGigabitEthernet1_2F0_2F0` | `/` → `_2F` |
+| `a_sl_b` | `a_5Fsl_5Fb` | `_` → `_5F` (aman, tidak ambigu) |
+
+Setiap karakter non-alnum di-encode sebagai `_XX` (hex 2 digit). Proses ini
+**100% reversible** — semua nama interface, termasuk yang mengandung `_`, `/`, `.`,
+spasi, atau karakter unicode, bisa dikembalikan persis.
+
+### Kepemilikan
+
+Hanya policer berawalan `vpptc-` yang boleh dihapus oleh `vpptc`. Policer tanpa prefix
+tersebut dianggap milik tool lain dan dilewati.
+
+Untuk migrasi dari `vpptc` versi lama, policer format `<iface>-<arah>-<cir>-<cb>` akan
+di-*adopt* (dianggap milik vpptc) **hanya** bila nama tersebut persis valid **dan**
+interface hasil dekoding-nya masih terdaftar di YAML.
+
+---
+
+## Keamanan
+
+### Validasi sebelum eksekusi
+
+`vpptc` menolak berhenti sebelum menyentuh VPP bila:
+
+- struktur YAML tidak valid / key tidak dikenali / ada duplikat slot
+- ada interface di YAML yang **tidak ada** di runtime VPP
+- `show interface` atau `show policer` **gagal dibaca** (mis. VPP mati)
+- format keluaran `show policer` tidak dikenali
+
+### Deteksi error
+
+`vppctl` **selalu keluar dengan exit code 0**, bahkan ketika perintahnya ditolak.
+Pesan error justru ditulis ke *stdout*, misalnya:
+
+```
+policer del: No such policer
+policer input: failed: `-6'
+policer add: Policer already exists
+show interface: unknown input `bogus99'
+```
+
+Karena itu `vpptc` tidak bergantung pada exit code saja. Perintah mutasi (`add`,
+`apply`, `unapply`, `del`) dianggap **berhasil hanya bila stdout kosong sepenuhnya**.
+Di samping itu ada **verifikasi akhir**: state VPP dibaca ulang dan dibandingkan dengan
+keinginan. Bila ada selisih, `vpptc` melaporkan kegagalan dan **tidak menulis** file
+startup.
+
+### Anti-tabrakan
+
+- **File lock** (`flock` pada `/run/lock/vpptc.lock`) mencegah dua `vpptc` berjalan
+  bersamaan. `--dry-run` tidak memakai lock (aman, karena read-only).
+- **Timeout 15 detik** per pemanggilan `vppctl`; tidak akan menggantung selamanya.
+- **Tulis atomik**: file startup ditulis ke `.tmp`, `fsync`, lalu `os.replace`. File
+  tidak pernah terpotong meski disk penuh atau proses dibunuh di tengah jalan.
+- **Rollback**: policer yang gagal dipasang langsung dilepas dan dihapus agar tidak
+  menjadi yatim.
+
+---
+
+## Exit Code
+
+| Code | Arti |
+|---|---|
+| `0` | Berhasil. |
+| `1` | Gagal: YAML salah, VPP tidak bisa dibaca, perintah ditolak, verifikasi akhir gagal, atau file startup tidak bisa ditulis. |
+| `2` | Argumen baris perintah tidak dikenal. |
+| `3` | Instance `vpptc` lain sedang berjalan (file lock). |
+
+Cocok untuk dipakai di CI, cron, atau `ExecStartPost=` systemd.
+
+---
+
+## Pemecahan Masalah
+
+### `Interface 'X' ... TIDAK DITEMUKAN di runtime VPP`
+
+Interface yang disebut di YAML belum ada di VPP. Pastikan interface sudah dibuat
+sebelum menjalankan `vpptc`:
+
+```bash
+vppctl show interface
+```
+
+### `[FATAL] Gagal membaca daftar interface dari VPP`
+
+VPP tidak berjalan atau `vppctl` tidak terhubung:
+
+```bash
+systemctl status vpp
+vppctl show version
+```
+
+### `[FATAL] Instance vpptc lain sedang berjalan`
+
+Ada proses lain yang memegang lock. Periksa, hentikan, atau hapus lock bila yakin
+prosesnya sudah mati:
+
+```bash
+pgrep -af vpptc
+rm -f /run/lock/vpptc.lock     # hanya bila yakin tidak ada proses aktif
+```
+
+### Policer hilang setelah restart VPP
+
+File startup yang dihasilkan **belum dimuat** oleh VPP saat boot. Lihat
+[Catatan Operasional](#catatan-operasional).
+
+### `[WARN] CIR 'X' bernilai di bawah 1 satuan, membulat menjadi 0`
+
+Nilai terlalu kecil dan dianggap "tanpa limitasi". Naikkan nilainya bila ini bukan
+maksud Anda, atau tulis `0` secara eksplisit bila memang ingin tanpa limitasi.
+
+### Melihat konfigurasi apa adanya tanpa mengubah apa pun
+
+```bash
+vpptc --dry-run
+```
+
+---
+
+## Catatan Operasional
+
+### ⚠️ Sync bersifat deklaratif dan agresif
+
+`vpptc` menganggap YAML sebagai **seluruh** konfigurasi yang dikelolanya. Setiap
+policer berawalan `vpptc-` yang tidak ada di YAML **akan dihapus**, termasuk untuk
+interface yang tidak disebut sama sekali di YAML.
+
+Artinya, menghapus satu blok dari YAML lalu menjalankan `vpptc` **akan mematikan shaping**
+pada interface tersebut. Selalu periksa baris `[-] LEPAS & HAPUS` pada `--dry-run`.
+
+### ⚠️ Persistensi lintas restart belum otomatis
+
+`vpptc` menulis `/etc/vpp/vpptc.vpp`, tetapi file tersebut **tidak otomatis dieksekusi**
+saat VPP start. Selama belum ditambahkan ke konfigurasi boot, **setiap restart VPP akan
+menghapus seluruh policer** hasil `vpptc`.
+
+Untuk mengaktifkannya, tambahkan di `/etc/vpp/bootstrap.vpp` (file yang sudah di-`exec`
+oleh `/etc/vpp/startup.conf`):
+
+```
+exec /etc/vpp/vpptc.vpp
+```
+
+Verifikasi:
+
+```bash
+systemctl restart vpp
+vppctl show policer | grep -c '^Name'    # harusnya sesuai jumlah di YAML
+```
+
+Pastikan juga `BondEthernet1` dan sub-interface `BondEthernet1.100` sudah ada di VPP
+sebelum baris-baris `policer ... BondEthernet1.100` di file startup dijalankan saat boot.
+
+---
+
+## Lisensi
+
+Dibuat untuk keperluan internal. Gunakan dan modifikasi sesuai kebutuhan.

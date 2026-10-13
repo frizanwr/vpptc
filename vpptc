@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+vpptc - VPP Simple Policer YAML Synchronizer
+
+Menyinkronkan konfigurasi simple-policer VPP dari file YAML ke runtime VPP,
+lalu menulis ulang file CLI startup sehingga konfigurasi tetap permanen
+setelah VPP restart.
+
+Konvensi:
+  * Nama policer yang DIHASILKAN tool ini memakai prefix "vpptc-" (lihat MANAGED_PREFIX).
+  * Hanya policer ber-prefix tersebut (atau nama format lama yang interface-nya
+    masih terdaftar di YAML) yang boleh dihapus oleh tool ini.
+"""
+import argparse
+import decimal
+import fcntl
+import os
+import re
+import subprocess
+import sys
+
+import yaml
+
+DEFAULT_CONFIG_FILE = "/etc/vpp/vpptc.yaml"
+DEFAULT_STARTUP_OUT_FILE = "/etc/vpp/vpptc.vpp"
+LOCK_FILE = "/run/lock/vpptc.lock"
+
+# Prefix penanda kepemilikan. Hanya policer dengan prefix ini yang boleh
+# dihapus oleh vpptc (lihat B3).
+MANAGED_PREFIX = "vpptc"
+
+VPPCTL_TIMEOUT = 15  # detik
+
+decimal.getcontext().prec = 40
+
+# Nilai ini berarti "tanpa limitasi", bukan error.
+UNLIMITED = 0
+
+
+def die(message, code=1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Serialisasi nama policer <-> interface
+# ---------------------------------------------------------------------------
+def interface_to_token(interface):
+    """Encode nama interface menjadi token aman (huruf/angka saja).
+
+    Semua karakter lain di-escape sebagai _XX (hex 2 digit, uppercase).
+    Hasilnya 100% reversible, berbeda dari skema _sl_/_dt_ lama yang ambigu.
+    """
+    if interface is None:
+        return ""
+    out = []
+    for byte in str(interface).encode("utf-8"):
+        char = chr(byte)
+        if char.isascii() and char.isalnum():
+            out.append(char)
+        else:
+            out.append(f"_{byte:02X}")
+    return "".join(out)
+
+
+def token_to_interface(token):
+    """Inverse dari interface_to_token. Return None bila token tidak valid."""
+    if not token or not re.fullmatch(r"(?:[A-Za-z0-9]|_[0-9A-F]{2})+", token):
+        return None
+    raw = bytearray()
+    i = 0
+    while i < len(token):
+        if token[i] == "_":
+            raw.append(int(token[i + 1:i + 3], 16))
+            i += 3
+        else:
+            raw.append(ord(token[i]))
+            i += 1
+    return raw.decode("utf-8", errors="replace")
+
+
+def generate_policer_name(interface, direction, cir_kbps, cb_bytes):
+    return (f"{MANAGED_PREFIX}-{interface_to_token(interface)}"
+            f"-{direction}-{cir_kbps}-{cb_bytes}")
+
+
+def decode_managed_name(policer_name):
+    """Decode nama format baru (vpptc-<token>-<direction>-<cir>-<cb>).
+
+    Kembalikan (interface, direction) atau (None, None).
+    """
+    parts = policer_name.split("-")
+    if len(parts) != 5:
+        return None, None
+    prefix, token, direction, cir, cb = parts
+    if prefix != MANAGED_PREFIX:
+        return None, None
+    if direction not in ("input", "output"):
+        return None, None
+    if not (cir.isdigit() and cb.isdigit()):
+        return None, None
+    interface = token_to_interface(token)
+    if not interface:
+        return None, None
+    return interface, direction
+
+
+def decode_legacy_name(policer_name, yaml_interfaces):
+    """Decode nama format lama (<iface>-<direction>-<cir>-<cb>).
+
+    Hanya dipakai untuk migrasi. Bila decoding ambigu (mis. interface asli
+    benar-benar mengandung '_sl_'), candidate yang terdaftar di YAML dipakai.
+    """
+    parts = policer_name.split("-")
+    if len(parts) < 4:
+        return None, None
+    direction = parts[-3]
+    if direction not in ("input", "output"):
+        return None, None
+    if not (parts[-2].isdigit() and parts[-1].isdigit()):
+        return None, None
+    safe_iface = "-".join(parts[:-3])
+    if not safe_iface:
+        return None, None
+    candidates = [safe_iface.replace("_sl_", "/").replace("_dt_", "."), safe_iface]
+    for candidate in candidates:
+        if candidate in yaml_interfaces:
+            return candidate, direction
+    return None, None
+
+
+def is_managed_name(policer_name, yaml_interfaces):
+    """True bila policer ini boleh dikelola (dan dihapus) oleh vpptc."""
+    if policer_name.startswith(MANAGED_PREFIX + "-"):
+        interface, _ = decode_managed_name(policer_name)
+        return interface is not None
+    interface, _ = decode_legacy_name(policer_name, yaml_interfaces)
+    return interface is not None
+
+
+# ---------------------------------------------------------------------------
+# Parsing nilai YAML -> satuan VPP
+# ---------------------------------------------------------------------------
+def _parse_quantity(val, unit_table, label):
+    val = str(val).lower().strip().replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?|\.\d+)([a-z]*)", val)
+    if not match:
+        raise ValueError(f"Format {label} '{val}' tidak dapat dibaca.")
+
+    try:
+        num = decimal.Decimal(match.group(1))
+    except decimal.InvalidOperation:
+        raise ValueError(f"Format {label} '{val}' tidak dapat dibaca.")
+
+    unit = match.group(2)
+    if unit not in unit_table:
+        raise ValueError(
+            f"Satuan {label} '{unit}' tidak valid. "
+            f"Gunakan: {', '.join(u for u in unit_table if u)}"
+        )
+
+    # Pembulatan half-up, bukan pemotongan diam-diam (H1).
+    return int((num * unit_table[unit]).quantize(decimal.Decimal("1"),
+                                                   rounding=decimal.ROUND_HALF_UP))
+
+
+def quantity_is_nonzero_text(val):
+    """True bila teks di YAML sebenarnyalane nol (mis. '0', '0.0k', '00').
+
+    Dipakai untuk membedakan "user menulis 0 = tanpa limitasi" dari
+    "user menulis nilai kecil yang membulat menjadi 0" - keduanya berakhir
+    sebagai 0, tapi hanya yang pertama yang disengaja.
+    """
+    text = str(val).lower().strip().replace(" ", "")
+    match = re.match(r"^(\d+(?:\.\d+)?|\.\d+)", text)
+    if not match:
+        return False
+    return decimal.Decimal(match.group(1)) != 0
+
+
+def parse_rate_to_kbps(val):
+    """'10m' -> 10000 (kbps). Nilai 0 berarti tanpa limitasi."""
+    return _parse_quantity(val, {
+        "": 1, "k": 1, "kbps": 1,
+        "m": 1000, "mbps": 1000,
+        "g": 1000000, "gbps": 1000000,
+    }, "CIR")
+
+
+def parse_burst_to_bytes(val):
+    """'100k' -> 100000 (bytes). Nilai 0 berarti tanpa limitasi."""
+    return _parse_quantity(val, {
+        "": 1, "b": 1, "byte": 1, "bytes": 1,
+        "k": 1000, "kb": 1000, "kbyte": 1000, "kbytes": 1000,
+        "m": 1000000, "mb": 1000000, "mbyte": 1000000, "mbytes": 1000000,
+        "g": 1000000000, "gb": 1000000000, "gbyte": 1000000000, "gbytes": 1000000000,
+    }, "CB")
+
+
+# ---------------------------------------------------------------------------
+# Interaksi dengan VPP
+# ---------------------------------------------------------------------------
+# PENTING: vppctl SELALU keluar dengan returncode 0, bahkan ketika perintahnya
+# ditolak. Pesan error dicetak ke stdout dengan format "<perintah>: <error>",
+# sedangkan perintah yang berhasil pada perintah mutasi tidak menghasilkan
+# keluaran sama sekali. Contoh nyata (VPP 26.06):
+#     "policer del: No such policer"
+#     "policer input: failed: `-6'"
+#     "policer add: Policer already exists"
+#     "show interface: unknown input `bogus99'"
+VPP_ERROR_RE = re.compile(
+    r"unknown input|parse error|syntax error|no such policer|not found|"
+    r"already exists|failed:|invalid |usage:|unrecognized|cannot |unable |"
+    # kegagalan koneksi ke daemon VPP (vppctl tetap exit 0)
+    r"unix connect|no such file or directory|connection refused|"
+    r"^\s*vppctl:",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def run_vppctl(command, silent=False, mutating=False, allow_empty=False):
+    """Jalankan satu perintah vppctl.
+
+    mutating=True   -> perintah mengubah state (add/del/apply/unapply).
+                       Sukses WAJIB menghasilkan stdout kosong.
+    mutating=False  -> perintah baca (show ...). Sukses WAJIB ada keluaran,
+                       kecuali allow_empty=True ('show policer' memang kosong
+                       saat belum ada policer sama sekali).
+    """
+    cmd = ["vppctl"] + command.split()
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=VPPCTL_TIMEOUT)
+    except FileNotFoundError:
+        die("  [FATAL] Perintah 'vppctl' tidak ditemukan. Apakah VPP terinstal?")
+    except subprocess.TimeoutExpired:
+        if not silent:
+            print(f"  [ERROR SISTEM] Perintah '{command}' timeout setelah "
+                  f"{VPPCTL_TIMEOUT} detik.")
+        return None
+    except Exception as exc:
+        if not silent:
+            print(f"  [ERROR SISTEM] Gagal mengeksekusi '{command}': {exc}")
+        return None
+
+    output = result.stdout.strip()
+    err_output = result.stderr.strip()
+
+    def reject(reason, message):
+        if not silent:
+            print(f"  [ERROR VPP] {reason} pada '{command}':\n    -> {message}")
+        return None
+
+    # 1. returncode (jarang, tapi tetap diperiksa)
+    if result.returncode != 0:
+        return reject("ditolak", err_output or output or f"exit {result.returncode}")
+
+    # 2. vppctl selalu exit 0; error sebenarnya muncul di stdout.
+    if err_output:
+        return reject("gagal", err_output)
+
+    if mutating:
+        # Perintah mutasi yang sukses tidak menghasilkan keluaran apa pun.
+        # Ada keluaran = VPP menolak.
+        if output:
+            return reject("ditolak", output)
+    else:
+        if not output and not allow_empty:
+            return reject("gagal", "tidak ada keluaran dari VPP "
+                                   "(perintah ditolak atau format tidak dikenal)")
+        if VPP_ERROR_RE.search(output):
+            return reject("ditolak", output)
+
+    return output
+
+
+def get_vpp_interfaces():
+    """Daftar interface dari VPP. Return None bila VPP tidak bisa dibaca."""
+    output = run_vppctl("show interface", silent=True)
+    if output is None:
+        return None
+
+    interfaces = set()
+    for line in output.splitlines():
+        if "---" in line:
+            continue
+        parts = line.split()
+        # Baris data VPP: "<nama> <idx> <up|down> ...". Baris counter lanjutan
+        # ("tx packets 38") ikut terpecah, jadi kolom kedua harus angka dan
+        # kolom ketiga harus status (H7).
+        if len(parts) < 3 or not parts[1].isdigit() or parts[2] not in ("up", "down"):
+            continue
+        interfaces.add(parts[0])
+
+    return interfaces
+
+
+def get_runtime_policers():
+    """Daftar nama policer yang ada di runtime VPP (terurut stabil)."""
+    output = run_vppctl("show policer")
+    if output is None:
+        die("\n[FATAL] Gagal membaca data dari VPP. "
+            "Pastikan service VPP sedang berjalan (systemctl status vpp).")
+
+    # Baris "Name "..." type 1r2c ..." adalah penanda policer di keluaran
+# "show policer". Parse per-baris (bukan memecah seluruh output per whitespace),
+# jadi baris lain yang kebetulan memuat "-input-" tidak ikut terambil.
+POLICER_NAME_RE = re.compile(r'^\s*Name\s+"([^"]+)"')
+POLICER_NAME_BARE_RE = re.compile(r"^\s*Name\s+(\S+)")
+
+
+def parse_policer_names(output):
+    """Ekstrak nama policer dari keluaran 'show policer'.
+
+    Dijaga ketat: hanya baris yang benar-benar diawali "Name ..." yang diambil.
+    """
+    names = []
+    for line in output.splitlines():
+        if "---" in line:
+            continue
+        match = POLICER_NAME_RE.match(line) or POLICER_NAME_BARE_RE.match(line)
+        if match:
+            name = match.group(1).strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def get_runtime_policers():
+    """Daftar nama policer yang ada di runtime VPP (urutan stabil)."""
+    output = run_vppctl("show policer", allow_empty=True)
+    if output is None:
+        die("\n[FATAL] Gagal membaca data dari VPP. "
+            "Pastikan service VPP sedang berjalan (systemctl status vpp).")
+
+    names = parse_policer_names(output)
+
+    if not names and not output:
+        return []  # VPP memang belum punya policer sama sekali - kondisi wajar
+
+    if not names:
+        # Keluaran ada tapi tidak ada baris 'Name ...': format tidak dikenali.
+        # Fail-safe: hentikan, jangan lanjut menebak-nebak.
+        die("[FATAL] Keluaran 'show policer' tidak bisa dibaca "
+            "(tidak ada baris 'Name ...'). Format VPP mungkin berubah:\n"
+            f"    -> {output}")
+
+    return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# Validasi YAML
+# ---------------------------------------------------------------------------
+def validate_yaml_schema(data):
+    if not isinstance(data, dict):
+        die("[ERROR YAML] Struktur YAML teratas harus berupa mapping/dictionary.")
+
+    if "simple_policers" not in data:
+        die("[ERROR YAML] Root key 'simple_policers' tidak ditemukan atau salah eja.")
+
+    # M1: key root level lain tidak boleh diabaikan diam-diam.
+    unknown_root = sorted(set(data.keys()) - {"simple_policers"})
+    if unknown_root:
+        die("[ERROR YAML] Key root level tidak dikenali: "
+            f"{', '.join(repr(k) for k in unknown_root)}.")
+
+    policers = data["simple_policers"]
+    if policers is None:
+        die("[ERROR YAML] 'simple_policers' tidak boleh kosong/null. "
+            "Gunakan 'simple_policers: []' bila memang tidak ada policer.")
+    if not isinstance(policers, list):
+        die("[ERROR YAML] 'simple_policers' harus berisi sebuah list.")
+
+    allowed_entry_keys = {"interface", "input", "output"}
+    allowed_dir_keys = {"cir", "cb"}
+    slot_owner = {}  # (interface, arah) -> indeks entriPertama (H5)
+
+    for idx, entry in enumerate(policers):
+        if not isinstance(entry, dict):
+            die(f"[ERROR YAML] Entri ke-{idx + 1} tidak valid (bukan mapping).")
+
+        for key in entry.keys():
+            if key not in allowed_entry_keys:
+                die(f"[ERROR YAML] Kesalahan pada entri ke-{idx + 1}: "
+                    f"Key '{key}' tidak dikenali.")
+
+        iface = entry.get("interface")
+        if iface is None or (isinstance(iface, str) and not iface.strip()):
+            die(f"[ERROR YAML] Kesalahan pada entri ke-{idx + 1}: "
+                "Key 'interface' wajib didefinisikan.")
+        if not isinstance(iface, str):
+            die(f"[ERROR YAML] Kesalahan pada entri ke-{idx + 1}: "
+                f"'interface' harus berupa teks, bukan {type(iface).__name__}.")
+
+        for direction in ("input", "output"):
+            if direction not in entry:
+                continue
+            dir_block = entry[direction]
+            if dir_block is None:
+                continue
+            if not isinstance(dir_block, dict):
+                die(f"[ERROR YAML] Blok '{direction}' pada interface '{iface}' "
+                    "harus memiliki format indentasi (mapping).")
+
+            for sub_key in dir_block.keys():
+                if sub_key not in allowed_dir_keys:
+                    die(f"[ERROR YAML] Kesalahan pada interface '{iface}' arah "
+                        f"'{direction}': Key '{sub_key}' tidak dikenali.")
+
+            for required in ("cir", "cb"):
+                if required not in dir_block:
+                    die(f"[ERROR YAML] Interface '{iface}' arah '{direction}' "
+                        f"tidak memiliki key '{required}'.")
+
+            # H5: satu interface + satu arah hanya boleh punya satu policer.
+            # Duplikat dulu membuat file CLI startup memuat perintah yang sama
+            # dua kali (policer add kedua gagal saat boot), dan kalau nilainya
+            # berbeda, tool sempat membuat dua policer pada slot yang sama.
+            slot = (iface, direction)
+            if slot in slot_owner:
+                die(f"[ERROR YAML] Duplikat: interface '{iface}' arah '{direction}' "
+                    f"didefinisikan pada entri ke-{slot_owner[slot] + 1} dan "
+                    f"ke-{idx + 1}. VPP hanya menerima satu policer per interface "
+                    "per arah - gabungkan menjadi satu blok.")
+            slot_owner[slot] = idx
+
+
+# ---------------------------------------------------------------------------
+# Sinkronisasi
+# ---------------------------------------------------------------------------
+def sync_simple_policers(yaml_policers, is_dry_run):
+    """Kembalikan (startup_commands, changed, failures)."""
+    print("[INFO] Membaca state VPP saat ini...")
+
+    valid_interfaces = get_vpp_interfaces()
+    if valid_interfaces is None:
+        die("[FATAL] Gagal membaca daftar interface dari VPP. "
+            "Operasi dibatalkan demi keamanan (H3).")
+
+    yaml_interfaces = {entry["interface"] for entry in yaml_policers}
+
+    # --- PENGAMAN FATAL: cek keberadaan interface sebelum ada perubahan apa pun ---
+    missing = sorted(i for i in yaml_interfaces if i not in valid_interfaces)
+    if missing:
+        print("\n[ERROR SISTEM] Eksekusi dibatalkan!")
+        for iface in missing:
+            print(f" -> Interface '{iface}' yang terdaftar di file YAML "
+                  "TIDAK DITEMUKAN di runtime VPP.")
+        print(" -> Pastikan interface tersebut sudah dibuat sebelum "
+              "mengonfigurasi policer.")
+        sys.exit(1)
+
+    runtime_names = get_runtime_policers()
+
+    managed_runtime = []
+    foreign = []
+    for name in runtime_names:
+        (managed_runtime if is_managed_name(name, yaml_interfaces)
+         else foreign).append(name)
+
+    desired_state = {}
+    startup_commands = []
+    seen_slots = {}
+
+    for entry in yaml_policers:
+        iface = entry["interface"]
+        for direction in ("input", "output"):
+            if direction not in entry or not entry[direction]:
+                continue
+            config = entry[direction]
+
+            try:
+                cir_kbps = parse_rate_to_kbps(config["cir"])
+                cb_bytes = parse_burst_to_bytes(config["cb"])
+            except ValueError as ve:
+                print(f"\n[ERROR YAML] Kesalahan nilai pada interface '{iface}' "
+                      f"arah '{direction}':")
+                print(f" -> {ve}")
+                print("Operasi dibatalkan. Silakan perbaiki nilai tersebut di YAML.\n")
+                sys.exit(1)
+
+            # H2: CIR atau CB bernilai 0 = tanpa limitasi -> tidak dibuat policer.
+            if cir_kbps == UNLIMITED or cb_bytes == UNLIMITED:
+                if cir_kbps == UNLIMITED:
+                    which, raw = "CIR", config["cir"]
+                else:
+                    which, raw = "CB", config["cb"]
+                if quantity_is_nonzero_text(raw):
+                    # Nilai kecil seperti '0.4k' (=0.4 kbps) membulat ke 0.
+                    # Kalau tidak diberi tahu, ini akan diam-diam berubah
+                    # menjadi "tanpa limitasi".
+                    print(f"[WARN] Interface '{iface}' arah '{direction}': "
+                          f"{which} '{raw}' bernilai di bawah 1 satuan, "
+                          f"membulat menjadi 0 -> dianggap TANPA LIMITASI dan "
+                          "policer tidak dibuat. Naikkan nilainya bila ini "
+                          "bukan yang Anda maksud.")
+                else:
+                    print(f"[INFO] Interface '{iface}' arah '{direction}': "
+                          f"{which} = 0 -> dianggap tanpa limitasi, "
+                          "policer tidak dibuat.")
+                continue
+
+            name = generate_policer_name(iface, direction, cir_kbps, cb_bytes)
+            slot = (iface, direction)
+            if slot in seen_slots:
+                # Penjaga lapis kedua; validate_yaml_schema() sudah menolak
+                # duplikat lebih dulu, jadi blok ini nyaris tak terjangkau.
+                print(f"[WARN] Duplikat terlewat pada interface '{iface}' arah "
+                      f"'{direction}' - hanya konfigurasi pertama yang dipakai.")
+                continue
+            seen_slots[slot] = name
+            desired_state[name] = {
+                "interface": iface, "direction": direction,
+                "cir": cir_kbps, "cb": cb_bytes,
+            }
+            startup_commands.append(
+                f"policer add name {name} rate kbps cir {cir_kbps} cb {cb_bytes} "
+                "conform-action transmit exceed-action drop")
+            startup_commands.append(f"policer {direction} name {name} {iface}")
+
+    to_delete = sorted(n for n in managed_runtime if n not in desired_state)
+    to_add = sorted(n for n in desired_state if n not in managed_runtime)
+    changed = bool(to_delete or to_add)
+
+    print("\n" + "=" * 50)
+    print(" PERBANDINGAN KONFIGURASI (DIFF)")
+    print("=" * 50)
+    if not changed:
+        print(" [=] Semua konfigurasi sudah In-Sync (Tidak ada perubahan)")
+    else:
+        for name in to_delete:
+            iface, _ = decode_for_display(name, yaml_interfaces)
+            print(f" [-] LEPAS & HAPUS : {name}"
+                  + (f" (dari interface {iface})" if iface else ""))
+        for name in to_add:
+            cfg = desired_state[name]
+            print(f" [+] TAMBAH & PASANG : {name} "
+                  f"(CIR: {cfg['cir']} kbps, CB: {cfg['cb']} bytes)")
+    if foreign:
+        print(f" [*] DIABAIKAN      : {len(foreign)} policer di luar kepemilikan "
+              "vpptc (tidak akan diubah).")
+    print("=" * 50 + "\n")
+
+    if is_dry_run:
+        if changed:
+            print("[INFO] Mode --dry-run aktif. Tidak ada perubahan yang "
+                  "dieksekusi ke VPP.")
+        return startup_commands, changed, []
+
+    failures = []
+    if not changed:
+        return startup_commands, changed, failures
+
+    print("Mengeksekusi perubahan ke VPP...")
+
+    # Urutan: add baru -> unapply lama -> apply baru -> delete lama (H4).
+    created = []
+    for name in to_add:
+        cfg = desired_state[name]
+        print(f" -> [1/4] Membuat (add) {name} ...")
+        if run_vppctl(f"policer add name {name} rate kbps cir {cfg['cir']} "
+                      f"cb {cfg['cb']} conform-action transmit exceed-action drop",
+                      mutating=True) is None:
+            failures.append(name)
+            continue
+        created.append(name)
+
+    for name in to_delete:
+        iface, direction = decode_for_display(name, yaml_interfaces)
+        print(f" -> [2/4] Melepas (unapply) {name} ...")
+        if iface and direction:
+            if run_vppctl(f"policer {direction} unapply name {name} {iface}",
+                          mutating=True) is None:
+                # Bukan fatal: policer yang memang belum pernah dipasang akan
+                # ditolak. Yang menentukan berhasil atau tidaknya penghapusan
+                # adalah tahap [4/4].
+                print(f"    (policer mungkin memang belum terpasang ke {iface})")
+
+    for name in created:
+        cfg = desired_state[name]
+        print(f" -> [3/4] Memasang (apply) {name} ...")
+        if run_vppctl(f"policer {cfg['direction']} name {name} "
+                      f"{cfg['interface']}", mutating=True) is None:
+            failures.append(name)
+            # rollback: policer yang gagal dipasang dibuang agar tidak jadi yatim.
+            run_vppctl(f"policer {cfg['direction']} unapply name {name} "
+                       f"{cfg['interface']}", silent=True, mutating=True)
+            run_vppctl(f"policer del name {name}", silent=True, mutating=True)
+            continue
+
+    for name in to_delete:
+        print(f" -> [4/4] Menghapus (del) {name} ...")
+        if run_vppctl(f"policer del name {name}", mutating=True) is None:
+            failures.append(name)
+
+    # [5/5] Verifikasi: pastikan state runtime benar-benar sesuai keinginan.
+    problems = verify_runtime_state(desired_state, to_delete)
+
+    if failures:
+        print(f"\n[ERROR] {len(set(failures))} perintah gagal: "
+              + ", ".join(sorted(set(failures))))
+    if problems:
+        print("\n[ERROR] Verifikasi akhir gagal:")
+        for problem in problems:
+            print(f"    -> {problem}")
+    if failures or problems:
+        print("EKSEKUSI GAGAL - file startup TIDAK diperbarui.")
+    else:
+        print("Eksekusi selesai.")
+    return startup_commands, changed, failures + problems
+
+
+def verify_runtime_state(desired_state, to_delete):
+    """Baca ulang state VPP dan pastikan hasilnya sesuai kemauan (M6).
+
+    Lapisan kedua setelah deteksi error per-perintah: kalau ada perintah yang
+    dilaporkan sukses padahal tidak, state akhir tetap harus ketahuan.
+    """
+    output = run_vppctl("show policer", allow_empty=True)
+    if output is None:
+        return ["gagal membaca ulang state VPP untuk verifikasi"]
+    present = set(parse_policer_names(output))
+
+    problems = []
+    for name in desired_state:
+        if name not in present:
+            problems.append(f"{name} tidak ada di VPP setelah sinkronisasi")
+    for name in to_delete:
+        if name in present:
+            problems.append(f"{name} masih ada di VPP setelah dihapus")
+    return problems
+
+
+def decode_for_display(name, yaml_interfaces):
+    """Decode nama policer untuk keperluan pesan/CLI, dengan validasi ketat."""
+    interface, direction = decode_managed_name(name)
+    if interface is not None:
+        return interface, direction
+    return decode_legacy_name(name, yaml_interfaces)
+
+
+# ---------------------------------------------------------------------------
+# File startup
+# ---------------------------------------------------------------------------
+def write_startup_file(path, commands, source_config):
+    """Tulis file CLI startup secara atomik (BUG MINOR: file tidak terpotong)."""
+    header = [
+        "// AUTO-GENERATED by vpptc - DO NOT EDIT MANUALLY",
+        f"// Regenerate with: vpptc --config {source_config}",
+    ]
+    body = "\n".join(header + commands)
+    if commands:
+        body += "\n"
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        print(f"[Gagal] Tidak dapat menyimpan file startup: {exc}")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+def acquire_lock():
+    """Cegah dua vpptc berjalan bersamaan (BUG MINOR: race condition)."""
+    try:
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+        handle = open(LOCK_FILE, "w")
+    except Exception as exc:
+        print(f"[WARN] Gagal membuat lock file ({exc}), melanjutkan tanpa lock.")
+        return None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        die("[FATAL] Instance vpptc lain sedang berjalan. Selesai dulu atau "
+            "hapus lock bila yakin tidak ada proses aktif.", code=3)
+    return handle
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VPP Policer YAML Synchronizer")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Menampilkan diff tanpa melakukan eksekusi ke VPP")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
+                        help=f"File YAML konfigurasi (default: {DEFAULT_CONFIG_FILE})")
+    parser.add_argument("--startup-file", default=DEFAULT_STARTUP_OUT_FILE,
+                        help=f"File CLI startup yang dihasilkan "
+                             f"(default: {DEFAULT_STARTUP_OUT_FILE})")
+    args = parser.parse_args()
+
+    config_path = args.config
+
+    if not os.path.exists(config_path):
+        print(f"File konfigurasi tidak ditemukan: {config_path}")
+        sys.exit(1)
+
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        print(f"[ERROR] Format YAML tidak valid. "
+              f"Periksa spasi atau indentasi file {config_path}.")
+        print(exc)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"[ERROR] Gagal membaca file konfigurasi: {exc}")
+        sys.exit(1)
+
+    if data is None:
+        print(f"[ERROR] File {config_path} kosong.")
+        sys.exit(1)
+
+    validate_yaml_schema(data)
+
+    simple_policers = data["simple_policers"]
+
+    if args.dry_run:
+        # M5: dry-run murni "lihat apa yang berubah" -> tidak ada file yang ditulis.
+        sync_simple_policers(simple_policers, True)
+        sys.exit(0)
+
+    lock = acquire_lock()
+    try:
+        # H6: startup file selalu ditulis ulang, termasuk saat daftar policer kosong,
+        # supaya tidak ada perintah lama yang "hidup lagi" setelah restart.
+        startup_cmds, _, failures = sync_simple_policers(simple_policers, False)
+
+        if failures:
+            sys.exit(1)
+
+        if write_startup_file(args.startup_file, startup_cmds, config_path):
+            print(f"[OK] Perintah startup berhasil di-update dan disimpan ke: "
+                  f"{args.startup_file}")
+        else:
+            sys.exit(1)
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -21,9 +21,9 @@ import sys
 
 import yaml
 
-DEFAULT_CONFIG_FILE = "/etc/vpp/vpptc.yaml"
-DEFAULT_STARTUP_OUT_FILE = "/etc/vpp/vpptc.vpp"
-LOCK_FILE = "/run/lock/vpptc.lock"
+DEFAULT_CONFIG_FILE = "/etc/vpp/vpptc/vpptc.yaml"
+DEFAULT_STARTUP_OUT_FILE = "/etc/vpp/vpptc/vpptc.vpp"
+LOCK_FILE = "/tmp/vpptc.lock"
 
 # Prefix penanda kepemilikan. Hanya policer dengan prefix ini yang boleh
 # dihapus oleh vpptc (lihat B3).

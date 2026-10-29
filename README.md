@@ -36,7 +36,7 @@ akan dilepas dari VPP — termasuk oleh `vpptc` sendiri.
 | PyYAML | 6.0 |
 | `vppctl` | VPP 20.05+ (diuji v26.06-release) |
 | Akses | `vppctl` harus terhubung ke daemon VPP (umumnya perlu root) |
-| Lock | `/run/lock/` harus ada dan bisa ditulis |
+| Lock | `/run/lock/vpptc.lock` dimiliki `root:vpp` mode `0660`; user harus anggota grup `vpp` |
 
 Hanya dependensi standar + PyYAML. Tidak ada library pihak ketiga lain.
 
@@ -54,6 +54,26 @@ python3 -c "import yaml" || pip3 install pyyaml
 # 3. cek versi
 /usr/local/sbin/vpptc --help
 ```
+
+### Izin lock (grup `vpp`)
+
+`vpptc apply` memakai file lock `/run/lock/vpptc.lock`. File ini harus dimiliki
+`root:vpp` dengan mode `0660`, dan user yang menjalankan `vpptc apply` harus menjadi
+anggota grup `vpp`.
+
+```bash
+# aturan tmpfiles agar izin tetap benar setelah reboot (/run berbasis tmpfs)
+cat > /etc/tmpfiles.d/vpptc.conf <<'EOF'
+f /run/lock/vpptc.lock 0660 root vpp -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/vpptc.conf
+
+# tambahkan user yang berhak menjalankan vpptc apply ke grup vpp
+usermod -aG vpp <user>
+```
+
+Bila lock tidak bisa dibuat/diakses, `vpptc apply` **berhenti dengan exit code `3`** —
+tidak pernah melanjutkan tanpa proteksi. `plan` dan `check` tidak memerlukan lock.
 
 > **Penting:** jangan menaruh script di direktori yang tidak bisa diakses user lain
 > (mis. `/root`) bilahendak dijalankan oleh service/cron non-root. `/root` mode `0700`.
@@ -166,25 +186,30 @@ simple_policers:
 ## Pemakaian
 
 ```bash
-vpptc [--dry-run] [--config PATH] [--startup-file PATH]
+vpptc {plan|apply|check} [--config PATH] [--startup-file PATH]
 ```
+
+| Perintah | Keterangan |
+|---|---|
+| `vpptc check` | Periksa syntax/validitas file YAML (struktur, key, dan nilai CIR/CB) **tanpa menghubungi VPP** dan tanpa mengubah apa pun. |
+| `vpptc plan` | Tampilkan diff saja. **Tidak menulis dan tidak mengubah apa pun**, termasuk file startup. |
+| `vpptc apply` | Terapkan konfigurasi YAML ke runtime VPP dan tulis ulang file startup. |
 
 | Opsi | Default | Keterangan |
 |---|---|---|
-| `--dry-run` | — | Tampilkan diff saja. **Tidak menulis dan tidak mengubah apa pun**, termasuk file startup. |
 | `--config PATH` | `/etc/vpp/vpptc.yaml` | **Hanya untuk pengujian/staging.** Lihat [Aturan Produksi](#aturan-produksi). |
-| `--startup-file PATH` | `/etc/vpp/vpptc.vpp` | **Hanya untuk pengujian/staging.** Lihat [Aturan Produksi](#aturan-produksi). |
+| `--startup-file PATH` | `/etc/vpp/vpptc.vpp` | **Hanya untuk pengujian/staging** dan hanya berlaku untuk `plan`/`apply`. Lihat [Aturan Produksi](#aturan-produksi). |
 
 ### Aturan Produksi
 
-> **Di produksi, selalu jalankan `vpptc` tanpa opsi apa pun.**
+> **Di produksi, selalu jalankan `vpptc apply` tanpa opsi apa pun.**
 >
 > ```bash
-> vpptc
+> vpptc apply
 > ```
 >
 > Opsi `--config` dan `--startup-file` hanya untuk pengujian dan staging. Bila
-> dipakaikan di luar mode `--dry-run`, `vpptc` menampilkan peringatan besar di layar.
+> dipakaikan pada `apply`, `vpptc` menampilkan peringatan besar di layar.
 
 Alasannya adalah model full-replacement `vpptc`: **YAML adalah seluruh acuan.**
 Setiap policer berawalan `vpptc-` yang ada di VPP tetapi tidak ada di file yang
@@ -199,9 +224,9 @@ File yang dijalankan (hanya berisi loop0):
 Hasil: 2 policer di atas DIHAPUS
 ```
 
-Jadi menjalankan `vpptc --config <file-yang-lebih-sempit>` di mesin produksi akan
+Jadi menjalankan `vpptc apply --config <file-yang-lebih-sempit>` di mesin produksi akan
 **mematikan shaping pada interface yang tidak disebut di file tersebut**. Aturan ini
-mencegah hal itu karena `vpptc` selalu membaca `/etc/vpp/vpptc.yaml`.
+mencegah hal itu karena `vpptc apply` selalu membaca `/etc/vpp/vpptc.yaml`.
 
 Yang **tidak** terpengaruh: policer yang Anda buat manual lewat `vppctl` (namanya
 bukan `vpptc-`) tidak akan pernah disentuh — tool menandainya `[*] DIABAIKAN`.
@@ -209,15 +234,19 @@ bukan `vpptc-`) tidak akan pernah disentuh — tool menandainya `[*] DIABAIKAN`.
 ### Alur kerja yang disarankan
 
 ```bash
-vpptc --dry-run     # 1. lihat perubahannya
-                    # 2. periksa baris "[-] LEPAS & HAPUS" dengan teliti
-vpptc               # 3. terapkan
+vpptc check         # 1. pastikan YAML valid (tanpa menghubungi VPP)
+vpptc plan          # 2. lihat perubahannya
+                    # 3. periksa baris "[-] LEPAS & HAPUS" dengan teliti
+vpptc apply         # 4. terapkan
 ```
 
 ### Contoh keluaran
 
 ```
-$ vpptc --dry-run
+$ vpptc check
+[OK] File konfigurasi valid: /etc/vpp/vpptc.yaml
+
+$ vpptc plan
 [INFO] Membaca state VPP saat ini...
 
 ==================================================
@@ -229,7 +258,7 @@ $ vpptc --dry-run
  [*] DIABAIKAN      : 1 policer di luar kepemilikan vpptc (tidak akan diubah).
 ==================================================
 
-[INFO] Mode --dry-run aktif. Tidak ada perubahan yang dieksekusi ke VPP.
+[INFO] Mode 'plan' aktif. Tidak ada perubahan yang dieksekusi ke VPP.
 ```
 
 Arti penanda diff:
@@ -339,8 +368,10 @@ startup.
 
 ### Anti-tabrakan
 
-- **File lock** (`flock` pada `/run/lock/vpptc.lock`) mencegah dua `vpptc` berjalan
-  bersamaan. `--dry-run` tidak memakai lock (aman, karena read-only).
+- **File lock** (`flock` pada `/run/lock/vpptc.lock`, `root:vpp` mode `0660`) mencegah
+  dua `vpptc apply` berjalan bersamaan, termasuk antar-user dalam grup `vpp`.
+  `plan` dan `check` tidak memakai lock (aman, karena read-only). Bila lock tidak bisa
+  dibuat/diakses, `apply` **gagal tertutup** dengan exit code `3`.
 - **Timeout 15 detik** per pemanggilan `vppctl`; tidak akan menggantung selamanya.
 - **Tulis atomik**: file startup ditulis ke `.tmp`, `fsync`, lalu `os.replace`. File
   tidak pernah terpotong meski disk penuh atau proses dibunuh di tengah jalan.
@@ -356,7 +387,7 @@ startup.
 | `0` | Berhasil. |
 | `1` | Gagal: YAML salah, VPP tidak bisa dibaca, perintah ditolak, verifikasi akhir gagal, atau file startup tidak bisa ditulis. |
 | `2` | Argumen baris perintah tidak dikenal. |
-| `3` | Instance `vpptc` lain sedang berjalan (file lock). |
+| `3` | Instance `vpptc` lain sedang berjalan, atau file lock tidak bisa dibuat/diakses (izin/grup salah). |
 
 Cocok untuk dipakai di CI, cron, atau `ExecStartPost=` systemd.
 
@@ -367,7 +398,7 @@ Cocok untuk dipakai di CI, cron, atau `ExecStartPost=` systemd.
 ### `Interface 'X' ... TIDAK DITEMUKAN di runtime VPP`
 
 Interface yang disebut di YAML belum ada di VPP. Pastikan interface sudah dibuat
-sebelum menjalankan `vpptc`:
+sebelum menjalankan `vpptc apply`:
 
 ```bash
 vppctl show interface
@@ -392,6 +423,34 @@ pgrep -af vpptc
 rm -f /run/lock/vpptc.lock     # hanya bila yakin tidak ada proses aktif
 ```
 
+### `[FATAL] Tidak dapat membuka/membuat lock ... Permission denied`
+
+File lock tidak dapat diakses oleh user yang menjalankan `vpptc apply`. Periksa grup,
+kepemilikan, mode, dan keanggotaan user:
+
+```bash
+getent group vpp
+stat -c '%A %U:%G %n' /run/lock/vpptc.lock
+id -nG <user> | tr ' ' '\n' | grep -qx vpp \
+    && echo "anggota vpp" || echo "BUKAN anggota vpp"
+```
+
+Perbaiki dengan membuat ulang lock sesuai izin yang benar:
+
+```bash
+cat > /etc/tmpfiles.d/vpptc.conf <<'EOF'
+f /run/lock/vpptc.lock 0660 root vpp -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/vpptc.conf
+usermod -aG vpp <user>     # lalu login ulang atau jalankan: newgrp vpp
+```
+
+Pesan `Grup 'vpp' tidak ditemukan` berarti grup tersebut belum ada di sistem. Pastikan
+grup `vpp` sudah dibuat (biasanya oleh paket/instalasi VPP).
+
+Jangan mengakali error ini dengan menghapus lock saat proses lain aktif. `vpptc apply`
+sengaja berhenti dengan exit code `3` agar tidak pernah berjalan tanpa proteksi.
+
 ### Policer hilang setelah restart VPP
 
 File startup yang dihasilkan **belum dimuat** oleh VPP saat boot. Lihat
@@ -405,7 +464,16 @@ maksud Anda, atau tulis `0` secara eksplisit bila memang ingin tanpa limitasi.
 ### Melihat konfigurasi apa adanya tanpa mengubah apa pun
 
 ```bash
-vpptc --dry-run
+vpptc plan
+```
+
+### Memeriksa YAML tanpa VPP
+
+Gunakan `check` untuk memvalidasi struktur dan nilai YAML saja, misalnya di mesin
+staging atau pipeline CI yang tidak memiliki daemon VPP:
+
+```bash
+vpptc check --config /path/ke/vpptc.yaml
 ```
 
 ---
@@ -418,11 +486,11 @@ vpptc --dry-run
 policer berawalan `vpptc-` yang tidak ada di YAML **akan dihapus**, termasuk untuk
 interface yang tidak disebut sama sekali di YAML.
 
-Artinya, menghapus satu blok dari `/etc/vpp/vpptc.yaml` lalu menjalankan `vpptc`
+Artinya, menghapus satu blok dari `/etc/vpp/vpptc.yaml` lalu menjalankan `vpptc apply`
 **akan mematikan shaping** pada interface tersebut. Selalu periksa baris
-`[-] LEPAS & HAPUS` pada `--dry-run`.
+`[-] LEPAS & HAPUS` pada `vpptc plan`.
 
-Karena itu **jangan pernah menjalankan `vpptc` dengan `--config` lain di mesin
+Karena itu **jangan pernah menjalankan `vpptc apply` dengan `--config` lain di mesin
 produksi** — lihat [Aturan Produksi](#aturan-produksi).
 
 ### ⚠️ Persistensi lintas restart belum otomatis
@@ -462,7 +530,7 @@ Karena itu `vpptc` menulis header dengan `#`:
 
 ```
 # AUTO-GENERATED by vpptc - DO NOT EDIT MANUALLY
-# Regenerate with: vpptc --config /etc/vpp/vpptc.yaml
+# Regenerate with: vpptc apply --config /etc/vpp/vpptc.yaml
 policer add name ... rate kbps cir ... cb ... conform-action transmit exceed-action drop
 policer input name ... TenGigabitEthernet1/0/0
 ```
